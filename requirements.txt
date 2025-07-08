@@ -1,0 +1,2 @@
+streamlit>=1.35.0
+openai>=1.30.0          # TTS 기능이 포함된 1.x 버전
