@@ -1,16 +1,19 @@
 # pages/03_텍스트_→_AI_이미지.py
 import streamlit as st
 from openai import OpenAI
-from itertools import repeat
+import requests, zipfile, io
 
 st.set_page_config(page_title="🖼️ AI 이미지 생성", page_icon="🖼️")
+
+# 🔑 OpenAI
 client = OpenAI(api_key=st.secrets["openai_api_key"])
 
+# ---------- UI ---------- #
 st.title("🖼️ 한국어 텍스트 → AI 이미지")
 
 korean_prompt = st.text_area(
     "🎨 **그리고 싶은 장면을 한국어로 묘사해 주세요!**",
-    placeholder="예) 햇살 속에서 자전거 타는 어린이, 픽사 스타일",
+    placeholder="예) 햇살 속 자전거를 타는 어린이, 따뜻한 파스텔 수채화 스타일",
     height=120,
 )
 
@@ -20,63 +23,73 @@ with col1:
 with col2:
     size = st.selectbox("📐 해상도", ["1024x1024", "1024x1792", "1792x1024"], index=0)
 
-# ------------------------------------------------------------
-def make_eng_prompt(ko: str) -> str:
-    """GPT-4o로 한국어 설명 → 60단어 이내 영문 프롬프트 변환"""
-    rsp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system",
-             "content": ("You are a prompt engineer for DALL·E-3. "
-                         "Rewrite the user's Korean description as a vivid, specific "
-                         "English prompt of max 60 words. No extra text.")},
-            {"role": "user", "content": ko},
-        ],
-    )
-    return rsp.choices[0].message.content.strip()
-
-
-def make_title(ko: str) -> str:
-    """GPT-4o로 ‘그림에 어울리는 한국어 제목’ 한 줄 생성"""
-    rsp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system",
-             "content": ("You are a creative copywriter. "
-                         "Write a short, poetic Korean title (max 12 words) "
-                         "that would suit an illustration of the following scene.")},
-            {"role": "user", "content": ko},
-        ],
-    )
-    return rsp.choices[0].message.content.strip()
-
-# ------------------------------------------------------------
+# ---------- 실행 ---------- #
 if st.button("🚀 이미지 생성") and korean_prompt.strip():
-    # 1) 한글 → 영문 프롬프트
+    # 1️⃣ GPT-4o가 영문 프롬프트 생성
     with st.spinner("💬 프롬프트 작성 중…"):
-        eng_prompt = make_eng_prompt(korean_prompt)
+        eng_prompt = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system",
+                 "content": ("You are a prompt engineer for DALL·E. "
+                             "Rewrite the user's Korean description as an English prompt "
+                             "of max 60 words, vivid and specific, no extra text.")},
+                {"role": "user", "content": korean_prompt},
+            ],
+        ).choices[0].message.content.strip()
+
+    # 2️⃣ GPT-4o가 한국어 제목(20자 이내) 생성
+    title = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system",
+             "content": "사용자 입력을 보고 어울리는 한국어 제목을 20자 이내로 지어 줘."},
+            {"role": "user", "content": korean_prompt},
+        ],
+    ).choices[0].message.content.strip()
 
     st.markdown("✏️ **영문 프롬프트**")
     st.code(eng_prompt, language="markdown")
 
-    # 2) 이미지 + 제목 1장씩 실시간 생성·표시
-    st.markdown("## 결과")
-    placeholder = st.empty()             # 첫 이미지용 빈 공간
-    for idx in repeat(None, num_images):
-        with st.spinner(f"🎨 {len(st.session_state)+1}/{num_images} 그리는 중…"):
-            img = client.images.generate(
+    # 3️⃣ 이미지 n장 순차 생성 + 즉시 표출
+    zip_items = []                 # (filename, bytes) 튜플 모으기
+    for idx in range(1, num_images + 1):
+        with st.spinner(f"🎨 이미지 {idx}/{num_images} 생성 중…"):
+            resp = client.images.generate(
                 model="dall-e-3",
                 prompt=eng_prompt,
-                n=1,                      # DALL·E-3는 n=1만 지원
+                n=1,               # 必: DALL·E-3 는 n=1만 지원
                 size=size,
                 quality="standard",
-            ).data[0].url
-            title = make_title(korean_prompt)
+            )
+            url  = resp.data[0].url
+            data = requests.get(url).content   # 다운로드해 ZIP에 넣을 바이트
 
-        # 현재 placeholder에 이미지+캡션 출력 후,
-        # 다음 이미지를 위해 새로운 placeholder 준비
-        placeholder.image(img, caption=title, use_column_width=True)
-        placeholder = st.empty()
+        # 화면에 바로 추가
+        st.image(url, caption=f"{title}", use_container_width=True)
+        st.download_button(
+            f"💾 이미지 {idx} 저장",
+            data,
+            file_name=f"ai_image_{idx}.png",
+            mime="image/png",
+        )
+        st.divider()
+
+        zip_items.append((f"ai_image_{idx}.png", data))
+
+    # 4️⃣ 모든 이미지 ZIP 한꺼번에 다운로드
+    if len(zip_items) > 1:
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w") as zf:
+            for fname, blob in zip_items:
+                zf.writestr(fname, blob)
+        zip_buf.seek(0)
+        st.download_button(
+            "📦 모든 이미지 ZIP 다운로드",
+            zip_buf,
+            file_name="ai_images.zip",
+            mime="application/zip",
+        )
 
 else:
-    st.caption("☝️ 장면을 입력하고 **[🚀 이미지 생성]** 버튼을 눌러 보세요.")
+    st.caption("☝️ 먼저 장면을 입력하고 **[🚀 이미지 생성]** 버튼을 눌러 보세요.")
