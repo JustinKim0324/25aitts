@@ -3,3 +3,8 @@ openai>=1.30.0          # TTS 기능이 포함된 1.x 버전
 streamlit-webrtc>=0.53.0    # 실시간 마이크
 av>=11.0.0
 ffmpeg-python>=0.2.0
+streamlit
+openai-whisper
+streamlit-webrtc
+pydub
+numpy
