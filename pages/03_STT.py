@@ -1,69 +1,59 @@
-# ↑ 파일 첫머리: 추가 import
-import threading, asyncio, queue, av
+# pages/05_STT_debug.py
+import streamlit as st, av, queue, time, wave, io, tempfile, threading
 from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
 from openai import OpenAI
-import streamlit as st
 
-# ---------- OpenAI & Streamlit 기본 설정 ----------
-st.set_page_config(page_title="🎙️ 실시간 STT", page_icon="🎙️")
+st.set_page_config(page_title="STT DEBUG", page_icon="🔧")
 client = OpenAI(api_key=st.secrets["openai_api_key"])
-st.title("🎙️ 실시간 음성 인식 (한국어)")
 
-# ---------- 1) 오디오 프로세서 ----------
-class AudioProcessor(AudioProcessorBase):
+st.title("🔧 Whisper-1 배치-STT 디버그 (1 초 주기)")
+
+# 1. 오디오 캡처 & 16 kHz mono 변환
+class AudioProc(AudioProcessorBase):
     def __init__(self):
         self.q = queue.Queue()
-
-    def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
-        mono16 = frame.reformat(format="s16", layout="mono", rate=16000)
-        self.q.put(mono16.planes[0].to_bytes())
+    def recv_audio(self, frame: av.AudioFrame):
+        pcm16 = frame.reformat(format="s16", layout="mono", rate=16_000)
+        self.q.put(pcm16.planes[0].to_bytes())
         return frame
 
-
-processor = webrtc_streamer(
-    key="stt-demo",
-    audio_processor_factory=AudioProcessor,
+ctx = webrtc_streamer(
+    key="stt-debug",
+    audio_processor_factory=AudioProc,
     media_stream_constraints={"audio": True, "video": False},
-    async_processing=True,
 )
 
-# ---------- 2) 백그라운드 event-loop (한 번만 생성) ----------
-if "bg_loop" not in st.session_state:
-    st.session_state.bg_loop = asyncio.new_event_loop()
-    threading.Thread(
-        target=st.session_state.bg_loop.run_forever,
-        daemon=True
-    ).start()
+# 2. 1 초 버퍼 → Whisper-1  (Thread)
+def stt_worker(q: queue.Queue, placeholder):
+    buf = b""; last = 0
+    while True:
+        try:
+            buf += q.get(timeout=0.1)
+        except queue.Empty:
+            pass
+        # 32 000 byte ≈ 1 s @16 kHz mono 16-bit
+        if len(buf) >= 32_000 and time.time() - last > 0.8:
+            wav_bytes = io.BytesIO()
+            with wave.open(wav_bytes, "wb") as wf:
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16_000)
+                wf.writeframes(buf)
+            wav_bytes.seek(0)
+            txt = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=wav_bytes,
+                response_format="text",
+                language="ko",
+            ).strip()
+            placeholder.markdown(f"📝 **{txt}**")
+            st.sidebar.write(f"Chunk OK · {len(buf)} bytes")   # 실시간 로그
+            buf = b""; last = time.time()
 
-# ---------- 3) STT 스트리밍 코루틴 ----------
-async def transcribe_loop(audio_q: queue.Queue):
-    st_placeholder = st.empty()
-    aggregator = b""
-    async with client.audio.transcriptions.with_stream(
-        model="gpt-4o-transcribe",
-        response_format="text",
-        language="ko"
-    ) as streamer:
-        while True:
-            try:
-                chunk = audio_q.get(timeout=0.1)
-                aggregator += chunk
-                # 0.25 초 이상 모으면 전송
-                if len(aggregator) > 8000:
-                    await streamer.send_chunk(aggregator)
-                    aggregator = b""
-            except queue.Empty:
-                pass
-            async for text in streamer.iter_text(timeout=0):
-                st_placeholder.markdown(f"📝 **{text.strip()}**")
-
-# ---------- 4) 마이크 켜지면 코루틴 등록 ----------
-if processor and processor.state.playing:
-    if "stt_future" not in st.session_state:
-        st.session_state.stt_future = asyncio.run_coroutine_threadsafe(
-            transcribe_loop(processor.audio_processor.q),
-            st.session_state.bg_loop
-        )
-    st.info("🎤 마이크가 켜졌습니다. 말을 하면 자막이 실시간으로 나타납니다.")
+if ctx and ctx.state.playing:
+    placeholder = st.empty()
+    if "dbg_thread" not in st.session_state:
+        st.session_state.dbg_thread = threading.Thread(
+            target=stt_worker, args=(ctx.audio_processor.q, placeholder), daemon=True
+        ).start()
+    st.info("🎤 말하면 1 초 뒤 자막이 뜹니다 (Logs 탭에서 바이트 수 / API 호출 확인)")
 else:
-    st.warning("▶️ 상단의 **Start** 버튼을 눌러 마이크 스트림을 켜 주세요.")
+    st.warning("Start 버튼을 눌러 마이크 스트림을 켜 주세요.")
