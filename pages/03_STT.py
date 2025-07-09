@@ -1,54 +1,57 @@
-import streamlit as st, queue, time, io, wave
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
+import streamlit as st, base64, io, wave, time
 from openai import OpenAI
-import av
 
-st.set_page_config(page_title="🎙️ 실시간 STT (WebRTC)", page_icon="🎙️")
+st.set_page_config(page_title="🎙️ 실시간 STT (MediaRecorder)", page_icon="🎙️")
 client = OpenAI(api_key=st.secrets["openai_api_key"])
-st.title("🎙️ 실시간 음성 인식 - WebRTC (지연≈0.8 s)")
+st.title("🎙️ 실시간 음성 인식 - MediaRecorder (지연≈1 s)")
 
-# ─── 1) 오디오 캡처 & 16 kHz 변환 ───
-class AudioProc(AudioProcessorBase):
-    def __init__(self):
-        self.buf = bytearray()
-        self.last = 0
-        self.ph = st.empty()
+# ─── JS 컴포넌트 (500 ms WebM 청크) ───
+html_comp = """
+<button id="rec">🎤 Start / Stop</button>
+<script>
+let rec=null, chunks=[];
+document.getElementById("rec").onclick=async ()=>{
+  if(rec && rec.state==="recording"){rec.stop(); return;}
+  const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+  rec=new MediaRecorder(stream,{mimeType:"audio/webm"});
+  rec.ondataavailable=e=>{
+    chunks.push(e.data);
+    if(chunks.length>=2){       // ≈1 s
+      const blob=new Blob(chunks,{type:"audio/webm"});
+      chunks=[];
+      const fr=new FileReader();
+      fr.onload=()=>{window.parent.postMessage(fr.result,'*');};
+      fr.readAsDataURL(blob);
+    }
+  };
+  rec.start(500);
+};
+</script>
+"""
+st.components.v1.html(html_comp, height=80)
 
-    def recv_audio(self, frame: av.AudioFrame):
-        pcm = frame.reformat(format="s16", layout="mono", rate=16_000)
-        self.buf += pcm.planes[0].to_bytes()
+# ─── 메시지 수신 → Whisper 호출 ───
+if "subs" not in st.session_state: st.session_state.subs=""
+msg = st.experimental_get_query_params().get("streamlit_message")
+# 위 방식 대신 postMessage → Streamlit 이벤트 처리용 JS <-> Py bridge 사용 시 @st.experimental_memo 로 변환 가능
 
-        # 1 s(32 kB) 단위로 Whisper 호출
-        if len(self.buf) >= 32_000 and time.time() - self.last > .7:
-            wav = io.BytesIO()
-            with wave.open(wav, "wb") as wf:
-                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16_000)
-                wf.writeframes(self.buf[:32_000])
-            wav.seek(0)
-            txt = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=wav,
-                language="ko",
-                response_format="text",
-                temperature=0
-            ).strip()
-            self.ph.markdown(f"📝 **{txt}**")
-            self.buf.clear(); self.last = time.time()
-        return frame
+st.subheader("자막")
+st.markdown(st.session_state.subs or "🕒 대기 중…")
 
-# ─── 2) WebRTC 스트림 (TURN 포함) ───
-webrtc_streamer(
-    key="stt-webrtc",
-    audio_processor_factory=AudioProc,
-    media_stream_constraints={"audio": True, "video": False},
-    rtc_configuration={
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]},
-            {"urls": ["turn:openrelay.metered.ca:80?transport=tcp"],
-             "username": "openrelayproject", "credential": "openrelayproject"}
-        ]
-    },
-    async_processing=True,
-)
+def handle_js_msg():
+    import json, re
+    raw = st.experimental_get_query_params().get("streamlit_message")
+    if not raw: return
+    m = re.match(r"data:audio\\/webm;base64,(.*)", raw)
+    if not m: return
+    wav = webm_to_wav(base64.b64decode(m.group(1)))   # ffmpeg-python 또는 av 사용
+    txt = client.audio.transcriptions.create(
+        model="whisper-1",
+        file=io.BytesIO(wav),
+        language="ko",
+        response_format="text",
+    ).strip()
+    st.session_state.subs += " " + txt
+    st.experimental_set_query_params(streamlit_message="")  # 메시지 소비
 
-st.caption("Start 를 눌러 마이크 권한을 허용하면 1 초 내외로 자막이 표시됩니다.")
+handle_js_msg()
