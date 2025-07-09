@@ -1,57 +1,64 @@
-import streamlit as st, base64, io, wave, time
+import streamlit as st, base64, io, wave, ffmpeg, uuid
 from openai import OpenAI
 
-st.set_page_config(page_title="🎙️ 실시간 STT (MediaRecorder)", page_icon="🎙️")
+st.set_page_config(page_title="🎙️ STT · MediaRecorder", page_icon="🎙️")
 client = OpenAI(api_key=st.secrets["openai_api_key"])
-st.title("🎙️ 실시간 음성 인식 - MediaRecorder (지연≈1 s)")
+st.title("🎙️ 실시간 음성 인식 (TURN 불필요)")
 
-# ─── JS 컴포넌트 (500 ms WebM 청크) ───
-html_comp = """
+# ---------- 1) 브라우저 측 녹음 버튼 ---------- #
+rec_key = f"rec-{uuid.uuid4()}"       # 세션마다 고유키
+st.components.v1.html(
+    f"""
 <button id="rec">🎤 Start / Stop</button>
 <script>
-let rec=null, chunks=[];
-document.getElementById("rec").onclick=async ()=>{
-  if(rec && rec.state==="recording"){rec.stop(); return;}
-  const stream=await navigator.mediaDevices.getUserMedia({audio:true});
-  rec=new MediaRecorder(stream,{mimeType:"audio/webm"});
-  rec.ondataavailable=e=>{
-    chunks.push(e.data);
-    if(chunks.length>=2){       // ≈1 s
-      const blob=new Blob(chunks,{type:"audio/webm"});
-      chunks=[];
-      const fr=new FileReader();
-      fr.onload=()=>{window.parent.postMessage(fr.result,'*');};
-      fr.readAsDataURL(blob);
-    }
-  };
+let rec=null,ch=[];
+document.getElementById("rec").onclick=async () => {{
+  if(rec && rec.state==="recording"){{rec.stop();return;}}
+  const s=await navigator.mediaDevices.getUserMedia({{audio:true}});
+  rec=new MediaRecorder(s,{{mimeType:"audio/webm"}});
+  rec.ondataavailable=e=>{{ch.push(e.data);
+    if(ch.length>=2){{
+      const blob=new Blob(ch,{{type:"audio/webm"}}); ch=[];
+      blob.arrayBuffer().then(buf=>{{
+        const b64=btoa(String.fromCharCode(...new Uint8Array(buf)));
+        fetch("/",{{method:"POST",
+          headers:{{"x-streamlit-message":"{rec_key}", "Content-Type":"text/plain"}},
+          body:b64}});
+      }});
+    }}
+  }};
   rec.start(500);
-};
+}};
 </script>
-"""
-st.components.v1.html(html_comp, height=80)
+""",
+    height=70,
+)
 
-# ─── 메시지 수신 → Whisper 호출 ───
-if "subs" not in st.session_state: st.session_state.subs=""
-msg = st.experimental_get_query_params().get("streamlit_message")
-# 위 방식 대신 postMessage → Streamlit 이벤트 처리용 JS <-> Py bridge 사용 시 @st.experimental_memo 로 변환 가능
+# ---------- 2) POST 요청 수신 → Whisper ---------- #
+if "headers" in st.session_state and st.session_state.headers.get("x-streamlit-message") == rec_key:
+    b64 = st.session_state["body"]
+    raw = base64.b64decode(b64)                 # webm bytes
 
-st.subheader("자막")
-st.markdown(st.session_state.subs or "🕒 대기 중…")
+    # webm → wav (16 kHz mono) 변환
+    wav, _ = (
+        ffmpeg
+        .input("pipe:0")
+        .output("pipe:1", format="wav", ac=1, ar="16k")
+        .run(input=raw, capture_stdout=True, quiet=True)
+    )
 
-def handle_js_msg():
-    import json, re
-    raw = st.experimental_get_query_params().get("streamlit_message")
-    if not raw: return
-    m = re.match(r"data:audio\\/webm;base64,(.*)", raw)
-    if not m: return
-    wav = webm_to_wav(base64.b64decode(m.group(1)))   # ffmpeg-python 또는 av 사용
-    txt = client.audio.transcriptions.create(
+    # Whisper-1 STT
+    text = client.audio.transcriptions.create(
         model="whisper-1",
         file=io.BytesIO(wav),
         language="ko",
-        response_format="text",
+        response_format="text"
     ).strip()
-    st.session_state.subs += " " + txt
-    st.experimental_set_query_params(streamlit_message="")  # 메시지 소비
 
-handle_js_msg()
+    # 화면 업데이트 (세션 상태 누적)
+    st.session_state.setdefault("subs", "")
+    st.session_state.subs += " " + text
+    st.stop()                                  # 즉시 응답 끝
+
+st.subheader("자막")                            # 최초 화면
+st.markdown(st.session_state.get("subs", "🕒 대기 중…"))
