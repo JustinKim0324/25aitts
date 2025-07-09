@@ -1,59 +1,54 @@
-# pages/05_STT_debug.py
-import streamlit as st, av, queue, time, wave, io, tempfile, threading
+import streamlit as st, queue, time, io, wave
 from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
 from openai import OpenAI
+import av
 
-st.set_page_config(page_title="STT DEBUG", page_icon="🔧")
+st.set_page_config(page_title="🎙️ 실시간 STT (WebRTC)", page_icon="🎙️")
 client = OpenAI(api_key=st.secrets["openai_api_key"])
+st.title("🎙️ 실시간 음성 인식 - WebRTC (지연≈0.8 s)")
 
-st.title("🔧 Whisper-1 배치-STT 디버그 (1 초 주기)")
-
-# 1. 오디오 캡처 & 16 kHz mono 변환
+# ─── 1) 오디오 캡처 & 16 kHz 변환 ───
 class AudioProc(AudioProcessorBase):
     def __init__(self):
-        self.q = queue.Queue()
+        self.buf = bytearray()
+        self.last = 0
+        self.ph = st.empty()
+
     def recv_audio(self, frame: av.AudioFrame):
-        pcm16 = frame.reformat(format="s16", layout="mono", rate=16_000)
-        self.q.put(pcm16.planes[0].to_bytes())
-        return frame
+        pcm = frame.reformat(format="s16", layout="mono", rate=16_000)
+        self.buf += pcm.planes[0].to_bytes()
 
-ctx = webrtc_streamer(
-    key="stt-debug",
-    audio_processor_factory=AudioProc,
-    media_stream_constraints={"audio": True, "video": False},
-)
-
-# 2. 1 초 버퍼 → Whisper-1  (Thread)
-def stt_worker(q: queue.Queue, placeholder):
-    buf = b""; last = 0
-    while True:
-        try:
-            buf += q.get(timeout=0.1)
-        except queue.Empty:
-            pass
-        # 32 000 byte ≈ 1 s @16 kHz mono 16-bit
-        if len(buf) >= 32_000 and time.time() - last > 0.8:
-            wav_bytes = io.BytesIO()
-            with wave.open(wav_bytes, "wb") as wf:
+        # 1 s(32 kB) 단위로 Whisper 호출
+        if len(self.buf) >= 32_000 and time.time() - self.last > .7:
+            wav = io.BytesIO()
+            with wave.open(wav, "wb") as wf:
                 wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16_000)
-                wf.writeframes(buf)
-            wav_bytes.seek(0)
+                wf.writeframes(self.buf[:32_000])
+            wav.seek(0)
             txt = client.audio.transcriptions.create(
                 model="whisper-1",
-                file=wav_bytes,
-                response_format="text",
+                file=wav,
                 language="ko",
+                response_format="text",
+                temperature=0
             ).strip()
-            placeholder.markdown(f"📝 **{txt}**")
-            st.sidebar.write(f"Chunk OK · {len(buf)} bytes")   # 실시간 로그
-            buf = b""; last = time.time()
+            self.ph.markdown(f"📝 **{txt}**")
+            self.buf.clear(); self.last = time.time()
+        return frame
 
-if ctx and ctx.state.playing:
-    placeholder = st.empty()
-    if "dbg_thread" not in st.session_state:
-        st.session_state.dbg_thread = threading.Thread(
-            target=stt_worker, args=(ctx.audio_processor.q, placeholder), daemon=True
-        ).start()
-    st.info("🎤 말하면 1 초 뒤 자막이 뜹니다 (Logs 탭에서 바이트 수 / API 호출 확인)")
-else:
-    st.warning("Start 버튼을 눌러 마이크 스트림을 켜 주세요.")
+# ─── 2) WebRTC 스트림 (TURN 포함) ───
+webrtc_streamer(
+    key="stt-webrtc",
+    audio_processor_factory=AudioProc,
+    media_stream_constraints={"audio": True, "video": False},
+    rtc_configuration={
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["turn:openrelay.metered.ca:80?transport=tcp"],
+             "username": "openrelayproject", "credential": "openrelayproject"}
+        ]
+    },
+    async_processing=True,
+)
+
+st.caption("Start 를 눌러 마이크 권한을 허용하면 1 초 내외로 자막이 표시됩니다.")
