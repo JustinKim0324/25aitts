@@ -8,3 +8,7 @@ openai-whisper
 streamlit-webrtc
 pydub
 numpy
+streamlit
+audio-recorder-streamlit
+SpeechRecognition
+pydub
