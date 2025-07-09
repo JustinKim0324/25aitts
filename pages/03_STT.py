@@ -9,14 +9,16 @@ st.set_page_config(page_title="🎙️ 실시간 STT", page_icon="🎙️")
 client = OpenAI(api_key=st.secrets["openai_api_key"])
 st.title("🎙️ 실시간 음성 인식 (한국어)")
 
-# ---------- 1) AudioProcessor ----------
+# ---------- 1) 오디오 프로세서 ----------
 class AudioProcessor(AudioProcessorBase):
     def __init__(self):
         self.q = queue.Queue()
 
     def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
-        self.q.put(frame.to_ndarray().tobytes())   # PCM bytes
+        mono16 = frame.reformat(format="s16", layout="mono", rate=16000)
+        self.q.put(mono16.planes[0].to_bytes())
         return frame
+
 
 processor = webrtc_streamer(
     key="stt-demo",
